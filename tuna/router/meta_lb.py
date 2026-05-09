@@ -178,7 +178,9 @@ _spot_latencies = deque(maxlen=LATENCY_QUEUE_SIZE)
 _serverless_latencies = deque(maxlen=LATENCY_QUEUE_SIZE)
 
 # TTFT
-_ttft : int = 0
+_spot_ttft = deque(maxlen=LATENCY_QUEUE_SIZE)
+_serverless_ttft = deque(maxlen=LATENCY_QUEUE_SIZE)
+_ttft : int = 0  # Still keep this for now if needed, but we'll use deques for backend-specific metrics
 
 # ---------------------------------------------------------------------------
 # State accessors
@@ -294,14 +296,13 @@ def _percentile(data: list[float], p: float) -> float:
     return data[lower] * (1 - weight) + data[upper] * weight
 
 
-def calc_pxx(spot_samples: list[int], svl_samples: list[int]) -> dict:
+def calc_pxx(samples: list[int]) -> dict:
     """Calculate rolling latencies from provided snapshots."""
-    all_latencies = [lt / 1_000_000_000.0 for lt in spot_samples + svl_samples]
-    
+    latencies = [lt / 1_000_000_000.0 for lt in samples]
     return {
-        "50": round(_percentile(all_latencies, 50), 3),
-        "95": round(_percentile(all_latencies, 95), 3),
-        "99": round(_percentile(all_latencies, 99), 3),
+        "p50": round(_percentile(latencies, 50), 3),
+        "p95": round(_percentile(latencies, 95), 3),
+        "p99": round(_percentile(latencies, 99), 3),
     }
 
 
@@ -317,6 +318,8 @@ async def _route_stats() -> dict:
         # Take point-in-time snapshots of latency deques while under lock
         spot_samples = list(_spot_latencies)
         svl_samples = list(_serverless_latencies)
+        spot_ttft_samples = list(_spot_ttft)
+        svl_ttft_samples = list(_serverless_ttft)
         # Compute spot_ready including current ongoing ready period
         spot_ready_s = _spot_ready_cumulative_s
         if _spot_ready_since is not None:
@@ -326,7 +329,14 @@ async def _route_stats() -> dict:
     recent_spot = sum(1 for r in recent if r == "spot")
     recent_svl = recent_total - recent_spot
 
-    pxx_map = calc_pxx(spot_samples, svl_samples)
+    all_samples = spot_samples + svl_samples
+    global_pxx = calc_pxx(all_samples)
+    spot_pxx = calc_pxx(spot_samples)
+    svl_pxx = calc_pxx(svl_samples)
+    
+    # TTFT averages (in ms)
+    spot_ttft_avg = (sum(spot_ttft_samples) / len(spot_ttft_samples) / 1_000_000.0) if spot_ttft_samples else 0.0
+    svl_ttft_avg = (sum(svl_ttft_samples) / len(svl_ttft_samples) / 1_000_000.0) if svl_ttft_samples else 0.0
 
     return {
         "total": total,
@@ -342,9 +352,17 @@ async def _route_stats() -> dict:
         "gpu_seconds_serverless": round(gpu_s_svl, 2),
         "uptime_seconds": round(time.time() - _start_time, 2),
         "spot_ready_seconds": round(spot_ready_s, 2),
-        "p50": pxx_map["50"],
-        "p95": pxx_map["95"],
-        "p99": pxx_map["99"],
+        "p50": global_pxx["p50"],
+        "p95": global_pxx["p95"],
+        "p99": global_pxx["p99"],
+        "spot_p50_latency_ms": round(spot_pxx["p50"] * 1000, 2),
+        "spot_p95_latency_ms": round(spot_pxx["p95"] * 1000, 2),
+        "spot_p99_latency_ms": round(spot_pxx["p99"] * 1000, 2),
+        "serverless_p50_latency_ms": round(svl_pxx["p50"] * 1000, 2),
+        "serverless_p95_latency_ms": round(svl_pxx["p95"] * 1000, 2),
+        "serverless_p99_latency_ms": round(svl_pxx["p99"] * 1000, 2),
+        "spot_ttft_ms": round(spot_ttft_avg, 3), # Added precision
+        "serverless_ttft_ms": round(svl_ttft_avg, 3), # Added precision
     }
 
 
@@ -467,17 +485,23 @@ async def _enter_warming() -> None:
 async def _stream_and_track(response: httpx.Response, t0: float, backend_name: str):
     """Async generator: yield chunks from upstream and track GPU seconds on completion."""
     global _gpu_seconds_spot, _gpu_seconds_serverless, _ttft
+    global _spot_ttft, _serverless_ttft
     
     first_chunk = True
 
     try:
         async for chunk in response.aiter_bytes(chunk_size=4096):
             if chunk:
-                
                 if first_chunk:
-                    _ttft = time.perf_counter_ns() - t0
+                    # Measure TTFT when the first chunk is actually received
+                    ttft_val = time.perf_counter_ns() - t0
+                    _ttft = ttft_val
+                    async with _state_lock:
+                        if backend_name == "spot":
+                            _spot_ttft.append(ttft_val)
+                        else:
+                            _serverless_ttft.append(ttft_val)
                     first_chunk = False
-
                 yield chunk
     finally:
         await response.aclose()
@@ -754,6 +778,10 @@ async def proxy(request: Request, path: str = ""):
             return await _forward_to_serverless(request, path, headers, data, serverless_url)
 
         resp_headers = _filter_outgoing(dict(r.headers))
+        
+        # Track total request time for non-streaming path as well
+        # NOTE: _stream_and_track handles the streaming termination
+        
         return StreamingResponse(
             _stream_and_track(r, t0, backend_name),
             status_code=r.status_code,

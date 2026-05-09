@@ -30,6 +30,11 @@ class TestObservability:
         assert stats["p50"] == pytest.approx(expected_p50, abs=0.01)
         assert stats["p95"] == pytest.approx(expected_p95, abs=0.01)
         assert stats["p99"] == pytest.approx(expected_p99, abs=0.01)
+        
+        # Verify backend-specific fields
+        assert "serverless_p50_latency_ms" in stats
+        assert stats["serverless_p50_latency_ms"] == pytest.approx(expected_p50 * 1000, abs=10.0)
+        assert "serverless_ttft_ms" in stats
 
     @pytest.mark.asyncio
     async def test_pxx_on_health(self, client, mocker):
