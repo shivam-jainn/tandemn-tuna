@@ -171,6 +171,12 @@ _spot_ready_since: float | None = None
 _last_real_request_ts: float = 0.0
 _rejected_count: int = 0
 
+# Latency Tracking 
+_spot_latencies = deque(maxlen=200)
+_serverless_latencies = deque(maxlen=200)
+
+# TTFT
+_ttft : int = 0
 
 # ---------------------------------------------------------------------------
 # State accessors
@@ -421,14 +427,22 @@ async def _enter_warming() -> None:
 
 async def _stream_and_track(response: httpx.Response, t0: float, backend_name: str):
     """Async generator: yield chunks from upstream and track GPU seconds on completion."""
-    global _gpu_seconds_spot, _gpu_seconds_serverless
+    global _gpu_seconds_spot, _gpu_seconds_serverless, _ttft
+    
+    first_chunk = True
+
     try:
         async for chunk in response.aiter_bytes(chunk_size=4096):
             if chunk:
+                
+                if first_chunk:
+                    _ttft = time.perf_counter_ns() - t0
+                    first_chunk = False
+
                 yield chunk
     finally:
         await response.aclose()
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter_ns() - t0
         async with _state_lock:
             if backend_name == "spot":
                 _gpu_seconds_spot += elapsed
@@ -663,7 +677,7 @@ async def proxy(request: Request, path: str = ""):
 
         data = await request.body()
 
-        t0 = time.time()
+        t0 = time.perf_counter_ns()
         try:
             r = await _http_client.send(
                 _http_client.build_request(
@@ -672,7 +686,7 @@ async def proxy(request: Request, path: str = ""):
                 stream=True,
             )
         except httpx.HTTPError as e:
-            elapsed = time.time() - t0
+            elapsed = time.perf_counter_ns() - t0
             async with _state_lock:
                 if backend_name == "spot":
                     _gpu_seconds_spot += elapsed
@@ -691,7 +705,7 @@ async def proxy(request: Request, path: str = ""):
         # Retry on 5xx from spot — we haven't streamed anything yet, safe to failover
         if backend_name == "spot" and r.status_code >= 500 and serverless_url:
             await r.aclose()
-            elapsed = time.time() - t0
+            elapsed = time.perf_counter_ns() - t0
             async with _state_lock:
                 _gpu_seconds_spot += elapsed
             logger.warning("Spot returned %d, retrying on serverless", r.status_code)
