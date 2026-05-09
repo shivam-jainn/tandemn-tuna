@@ -778,10 +778,7 @@ async def proxy(request: Request, path: str = ""):
             return await _forward_to_serverless(request, path, headers, data, serverless_url)
 
         resp_headers = _filter_outgoing(dict(r.headers))
-        
-        # Track total request time for non-streaming path as well
-        # NOTE: _stream_and_track handles the streaming termination
-        
+    
         return StreamingResponse(
             _stream_and_track(r, t0, backend_name),
             status_code=r.status_code,
