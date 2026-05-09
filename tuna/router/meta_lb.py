@@ -127,6 +127,8 @@ ALLOW_HEALTH_NO_AUTH = _env_bool("ALLOW_HEALTH_NO_AUTH", False)
 ROUTE_WINDOW_SIZE = int(os.getenv("ROUTE_WINDOW_SIZE", "200"))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "100"))
 
+LATENCY_QUEUE_SIZE = 200
+
 # HTTP client — created in lifespan, shared across all requests.
 _http_client: httpx.AsyncClient | None = None
 _request_semaphore: asyncio.Semaphore | None = None
@@ -172,8 +174,8 @@ _last_real_request_ts: float = 0.0
 _rejected_count: int = 0
 
 # Latency Tracking 
-_spot_latencies = deque(maxlen=200)
-_serverless_latencies = deque(maxlen=200)
+_spot_latencies = deque(maxlen=LATENCY_QUEUE_SIZE)
+_serverless_latencies = deque(maxlen=LATENCY_QUEUE_SIZE)
 
 # TTFT
 _ttft : int = 0
@@ -275,6 +277,33 @@ async def _record_route(backend: str) -> None:
         else:
             _req_to_serverless += 1
 
+def _percentile(data: list[float], p: float) -> float:
+    """Standard percentile calculation via linear interpolation."""
+    if not data:
+        return 0.0
+    data = sorted(data)
+    n = len(data)
+    if n == 1:
+        return data[0]
+    idx = (n - 1) * p / 100.0
+    lower = int(idx)
+    upper = lower + 1
+    weight = idx - lower
+    if upper >= n:
+        return data[lower]
+    return data[lower] * (1 - weight) + data[upper] * weight
+
+
+def calc_pxx(spot_samples: list[int], svl_samples: list[int]) -> dict:
+    """Calculate rolling latencies from provided snapshots."""
+    all_latencies = [lt / 1_000_000_000.0 for lt in spot_samples + svl_samples]
+    
+    return {
+        "50": round(_percentile(all_latencies, 50), 3),
+        "95": round(_percentile(all_latencies, 95), 3),
+        "99": round(_percentile(all_latencies, 99), 3),
+    }
+
 
 async def _route_stats() -> dict:
     async with _state_lock:
@@ -285,13 +314,20 @@ async def _route_stats() -> dict:
         recent = list(_recent_routes)
         gpu_s_spot = _gpu_seconds_spot
         gpu_s_svl = _gpu_seconds_serverless
+        # Take point-in-time snapshots of latency deques while under lock
+        spot_samples = list(_spot_latencies)
+        svl_samples = list(_serverless_latencies)
         # Compute spot_ready including current ongoing ready period
         spot_ready_s = _spot_ready_cumulative_s
         if _spot_ready_since is not None:
             spot_ready_s += time.time() - _spot_ready_since
+
     recent_total = len(recent)
     recent_spot = sum(1 for r in recent if r == "spot")
     recent_svl = recent_total - recent_spot
+
+    pxx_map = calc_pxx(spot_samples, svl_samples)
+
     return {
         "total": total,
         "spot": spot,
@@ -306,6 +342,9 @@ async def _route_stats() -> dict:
         "gpu_seconds_serverless": round(gpu_s_svl, 2),
         "uptime_seconds": round(time.time() - _start_time, 2),
         "spot_ready_seconds": round(spot_ready_s, 2),
+        "p50": pxx_map["50"],
+        "p95": pxx_map["95"],
+        "p99": pxx_map["99"],
     }
 
 
@@ -446,8 +485,10 @@ async def _stream_and_track(response: httpx.Response, t0: float, backend_name: s
         async with _state_lock:
             if backend_name == "spot":
                 _gpu_seconds_spot += elapsed
+                _spot_latencies.append(elapsed)
             else:
                 _gpu_seconds_serverless += elapsed
+                _serverless_latencies.append(elapsed)
 
 
 # ---------------------------------------------------------------------------
