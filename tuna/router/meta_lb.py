@@ -32,6 +32,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import bisect
 import hmac
 import json
 import logging
@@ -39,7 +40,7 @@ import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict,Deque
 from urllib.parse import urlparse
 
 import httpx
@@ -129,6 +130,9 @@ MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "100"))
 
 LATENCY_QUEUE_SIZE = 200
 
+FAILOVER_WINDOWS_SECONDS = (60, 360, 3600, 36000)
+FAILOVER_LATENCY_WINDOW_SECONDS = 86400  # 24 hours
+
 # HTTP client — created in lifespan, shared across all requests.
 _http_client: httpx.AsyncClient | None = None
 _request_semaphore: asyncio.Semaphore | None = None
@@ -181,6 +185,12 @@ _serverless_latencies = deque(maxlen=LATENCY_QUEUE_SIZE)
 _spot_ttft = deque(maxlen=LATENCY_QUEUE_SIZE)
 _serverless_ttft = deque(maxlen=LATENCY_QUEUE_SIZE)
 _ttft : int = 0  # Still keep this for now if needed, but we'll use deques for backend-specific metrics
+
+# Failover metrics
+_spot_failover_count: int = 0
+_last_spot_failover_timestamp: float | None = None
+_spot_failover_timestamps: deque[float] = deque()
+_failover_latencies: deque[tuple[float, float]] = deque()  # (timestamp, latency_ns)
 
 # ---------------------------------------------------------------------------
 # State accessors
@@ -320,6 +330,22 @@ async def _route_stats() -> dict:
         svl_samples = list(_serverless_latencies)
         spot_ttft_samples = list(_spot_ttft)
         svl_ttft_samples = list(_serverless_ttft)
+
+        # Compute rolling failovers
+        now = time.time()
+        max_window = max(FAILOVER_WINDOWS_SECONDS)
+        while _spot_failover_timestamps and _spot_failover_timestamps[0] < now - max_window:
+            _spot_failover_timestamps.popleft()
+        
+        failover_ts_list = list(_spot_failover_timestamps)
+        
+        # Mean failover latency for past 24h
+        while _failover_latencies and _failover_latencies[0][0] < now - FAILOVER_LATENCY_WINDOW_SECONDS:
+            _failover_latencies.popleft()
+        
+        f_latencies = [l / 1_000_000.0 for _, l in _failover_latencies]
+        mean_f_latency = (sum(f_latencies) / len(f_latencies)) if f_latencies else None
+
         # Compute spot_ready including current ongoing ready period
         spot_ready_s = _spot_ready_cumulative_s
         if _spot_ready_since is not None:
@@ -337,6 +363,12 @@ async def _route_stats() -> dict:
     # TTFT averages (in ms)
     spot_ttft_avg = (sum(spot_ttft_samples) / len(spot_ttft_samples) / 1_000_000.0) if spot_ttft_samples else 0.0
     svl_ttft_avg = (sum(svl_ttft_samples) / len(svl_ttft_samples) / 1_000_000.0) if svl_ttft_samples else 0.0
+
+    total_failovers_in_window = len(failover_ts_list)
+    failover_rolling_counts = {}
+    for w in FAILOVER_WINDOWS_SECONDS:
+        idx = bisect.bisect_left(failover_ts_list, now - w)
+        failover_rolling_counts[f"spot_failover_count_{w}s"] = total_failovers_in_window - idx
 
     return {
         "total": total,
@@ -363,6 +395,10 @@ async def _route_stats() -> dict:
         "serverless_p99_latency_ms": round(svl_pxx["p99"] * 1000, 2),
         "spot_ttft_ms": round(spot_ttft_avg, 3), # Added precision
         "serverless_ttft_ms": round(svl_ttft_avg, 3), # Added precision
+        "spot_failover_count": _spot_failover_count,
+        "last_spot_failover_timestamp": _last_spot_failover_timestamp,
+        "mean_failover_latency_ms" : round(mean_f_latency, 2) if mean_f_latency is not None else None,
+        **failover_rolling_counts
     }
 
 
@@ -482,7 +518,7 @@ async def _enter_warming() -> None:
 # Streaming helpers
 # ---------------------------------------------------------------------------
 
-async def _stream_and_track(response: httpx.Response, t0: float, backend_name: str):
+async def _stream_and_track(response: httpx.Response, t0: float, backend_name: str, tspot: int | None = None):
     """Async generator: yield chunks from upstream and track GPU seconds on completion."""
     global _gpu_seconds_spot, _gpu_seconds_serverless, _ttft
     global _spot_ttft, _serverless_ttft
@@ -505,7 +541,8 @@ async def _stream_and_track(response: httpx.Response, t0: float, backend_name: s
                 yield chunk
     finally:
         await response.aclose()
-        elapsed = time.perf_counter_ns() - t0
+        now_ns = time.perf_counter_ns()
+        elapsed = now_ns - t0
         async with _state_lock:
             if backend_name == "spot":
                 _gpu_seconds_spot += elapsed
@@ -513,6 +550,9 @@ async def _stream_and_track(response: httpx.Response, t0: float, backend_name: s
             else:
                 _gpu_seconds_serverless += elapsed
                 _serverless_latencies.append(elapsed)
+                # If this was a failover, track the total failover latency
+                if tspot:
+                    _failover_latencies.append((time.time(), now_ns - tspot))
 
 
 # ---------------------------------------------------------------------------
@@ -520,10 +560,10 @@ async def _stream_and_track(response: httpx.Response, t0: float, backend_name: s
 # ---------------------------------------------------------------------------
 
 async def _forward_to_serverless(
-    request: Request, path: str, headers: dict, data: bytes, serverless_url: str,
+    request: Request, path: str, headers: dict, data: bytes, serverless_url: str, tspot: int
 ) -> Response:
     """Retry a failed spot request on the serverless backend."""
-    global _gpu_seconds_serverless
+    global _gpu_seconds_serverless, _spot_failover_count, _last_spot_failover_timestamp
     target_url = _build_proxy_url(
         serverless_url, path, request.url.query.encode() if request.url.query else None,
     )
@@ -531,6 +571,14 @@ async def _forward_to_serverless(
     # Swap in serverless auth token
     async with _state_lock:
         auth_token = _serverless_auth_token
+
+        # update failover metrics
+        now = time.time()
+        _spot_failover_count += 1
+        _last_spot_failover_timestamp = now
+        _spot_failover_timestamps.append(now)
+
+
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     else:
@@ -538,7 +586,7 @@ async def _forward_to_serverless(
 
     await _record_route("serverless")  # Count the retry as a serverless route
 
-    t0 = time.time()
+    t0 = time.perf_counter_ns()
     try:
         resp = await _http_client.send(
             _http_client.build_request(
@@ -547,15 +595,17 @@ async def _forward_to_serverless(
             stream=True,
         )
     except httpx.HTTPError as e:
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter_ns() - t0
+        failover_latency_elapsed = time.perf_counter_ns() - tspot
         async with _state_lock:
             _gpu_seconds_serverless += elapsed
+            _failover_latencies.append((time.time(), failover_latency_elapsed))
         logger.warning("Upstream error: %s", e)
         return Response(content="upstream_error", status_code=502)
 
     resp_headers = _filter_outgoing(dict(resp.headers))
     return StreamingResponse(
-        _stream_and_track(resp, t0, "serverless"),
+        _stream_and_track(resp, t0, "serverless", tspot=tspot),
         status_code=resp.status_code,
         headers=resp_headers,
         media_type=resp.headers.get("content-type"),
@@ -762,7 +812,7 @@ async def proxy(request: Request, path: str = ""):
             if backend_name == "spot" and serverless_url:
                 logger.warning("Spot request failed (%s), retrying on serverless", e)
                 await _set_state(SpotState.COLD, str(e))
-                return await _forward_to_serverless(request, path, headers, data, serverless_url)
+                return await _forward_to_serverless(request, path, headers, data, serverless_url, t0)
 
             logger.warning("Upstream error: %s", e)
             return Response(content="upstream_error", status_code=502)
@@ -775,7 +825,7 @@ async def proxy(request: Request, path: str = ""):
                 _gpu_seconds_spot += elapsed
             logger.warning("Spot returned %d, retrying on serverless", r.status_code)
             await _set_state(SpotState.COLD, f"status={r.status_code}")
-            return await _forward_to_serverless(request, path, headers, data, serverless_url)
+            return await _forward_to_serverless(request, path, headers, data, serverless_url, t0)
 
         resp_headers = _filter_outgoing(dict(r.headers))
     

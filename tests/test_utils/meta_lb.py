@@ -42,6 +42,13 @@ def reset_state():
     meta_lb._spot_ready_since = None
     meta_lb._last_real_request_ts = 0.0
     meta_lb._ttft = 0
+
+    # failover metrics
+    meta_lb._spot_failover_count = 0
+    meta_lb._last_spot_failover_timestamp = None
+    meta_lb._spot_failover_timestamps.clear()
+    meta_lb._failover_latencies.clear()
+
     # Ensure we have a fresh asyncio lock
     meta_lb._state_lock = asyncio.Lock()
     meta_lb._request_semaphore = asyncio.Semaphore(
