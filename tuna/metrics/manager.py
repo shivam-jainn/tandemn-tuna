@@ -49,13 +49,15 @@ class MetricsManager:
 
             if len(batch) >= self.flush_size:
                 await asyncio.to_thread(
-                    self.storage.append_snapshots,
+                    self.storage.append_snapshot,
                     batch,
                 )
 
                 batch.clear()
 
+from tuna.metrics.storage_clients.jsonl import JSONLStorage
+
 metrics_manager = MetricsManager(
-    storage=MetricsStorage(),
+    storage=JSONLStorage(),
     flush_size=100,
 )

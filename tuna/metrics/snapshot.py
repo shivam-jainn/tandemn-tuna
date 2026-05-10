@@ -36,6 +36,8 @@ class FailoverSnapshot:
 @dataclass
 class MetricsSnapshot:
     """Top-level metrics snapshot."""
+    
+    timestamp: int
 
     total: int
     spot: int
