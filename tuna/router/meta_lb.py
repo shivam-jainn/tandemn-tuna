@@ -42,10 +42,14 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Dict,Deque
 from urllib.parse import urlparse
+from dataclasses import asdict
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from tuna.metrics.snapshot import FailoverSnapshot, LatencySnapshot, MetricsSnapshot, TTFTSnapshot
+from tuna.metrics.manager import metrics_manager
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("meta_lb")
@@ -370,37 +374,98 @@ async def _route_stats() -> dict:
         idx = bisect.bisect_left(failover_ts_list, now - w)
         failover_rolling_counts[f"spot_failover_count_{w}s"] = total_failovers_in_window - idx
 
-    return {
-        "total": total,
-        "spot": spot,
-        "serverless": svl,
-        "rejected": rejected,
-        "pct_spot": (100.0 * spot / total) if total else 0.0,
-        "pct_serverless": (100.0 * svl / total) if total else 0.0,
-        "window_total": recent_total,
-        "window_spot": recent_spot,
-        "window_serverless": recent_svl,
-        "gpu_seconds_spot": round(gpu_s_spot, 2),
-        "gpu_seconds_serverless": round(gpu_s_svl, 2),
-        "uptime_seconds": round(time.time() - _start_time, 2),
-        "spot_ready_seconds": round(spot_ready_s, 2),
-        "p50": global_pxx["p50"],
-        "p95": global_pxx["p95"],
-        "p99": global_pxx["p99"],
-        "spot_p50_latency_ms": round(spot_pxx["p50"] * 1000, 2),
-        "spot_p95_latency_ms": round(spot_pxx["p95"] * 1000, 2),
-        "spot_p99_latency_ms": round(spot_pxx["p99"] * 1000, 2),
-        "serverless_p50_latency_ms": round(svl_pxx["p50"] * 1000, 2),
-        "serverless_p95_latency_ms": round(svl_pxx["p95"] * 1000, 2),
-        "serverless_p99_latency_ms": round(svl_pxx["p99"] * 1000, 2),
-        "spot_ttft_ms": round(spot_ttft_avg, 3), # Added precision
-        "serverless_ttft_ms": round(svl_ttft_avg, 3), # Added precision
-        "spot_failover_count": _spot_failover_count,
-        "last_spot_failover_timestamp": _last_spot_failover_timestamp,
-        "mean_failover_latency_ms" : round(mean_f_latency, 2) if mean_f_latency is not None else None,
-        **failover_rolling_counts
-    }
+    snapshot = MetricsSnapshot(
+            timestamp=int(now),
 
+            total=total,
+            spot=spot,
+            svl=svl,
+            rejected=rejected,
+
+            pct_spot=(100.0 * spot / total) if total else 0.0,
+            pct_serverless=(100.0 * svl / total) if total else 0.0,
+
+            window_total=recent_total,
+            window_spot=recent_spot,
+            window_serverless=recent_svl,
+
+            gpu_seconds_spot=round(gpu_s_spot, 2),
+            gpu_seconds_serverless=round(gpu_s_svl, 2),
+
+            uptime_seconds=round(
+                time.time() - _start_time,
+                2,
+            ),
+
+            spot_ready_seconds=round(
+                spot_ready_s,
+                2,
+            ),
+
+            latency=LatencySnapshot(
+                p50=global_pxx["p50"],
+                p95=global_pxx["p95"],
+                p99=global_pxx["p99"],
+
+                spot_p50_latency_ms=round(
+                    spot_pxx["p50"] * 1000,
+                    2,
+                ),
+                spot_p95_latency_ms=round(
+                    spot_pxx["p95"] * 1000,
+                    2,
+                ),
+                spot_p99_latency_ms=round(
+                    spot_pxx["p99"] * 1000,
+                    2,
+                ),
+
+                serverless_p50_latency_ms=round(
+                    svl_pxx["p50"] * 1000,
+                    2,
+                ),
+                serverless_p95_latency_ms=round(
+                    svl_pxx["p95"] * 1000,
+                    2,
+                ),
+                serverless_p99_latency_ms=round(
+                    svl_pxx["p99"] * 1000,
+                    2,
+                ),
+            ),
+
+            ttft=TTFTSnapshot(
+                spot_ttft_ms=round(
+                    spot_ttft_avg,
+                    3,
+                ),
+                serverless_ttft_ms=round(
+                    svl_ttft_avg,
+                    3,
+                ),
+            ),
+
+            failover=FailoverSnapshot(
+                spot_failover_count=_spot_failover_count,
+
+                last_spot_failover_timestamp=(
+                    _last_spot_failover_timestamp
+                ),
+
+                mean_failover_latency_ms=(
+                    round(mean_f_latency, 2)
+                    if mean_f_latency is not None
+                    else None
+                ),
+
+                failover_rolling_counts=(
+                    failover_rolling_counts
+                ),
+            ),
+        )
+
+    metrics_manager.enqueue(snapshot)    
+    return asdict(snapshot)
 
 # ---------------------------------------------------------------------------
 # Header filtering
